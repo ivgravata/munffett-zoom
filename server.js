@@ -1,5 +1,4 @@
-// server.js
-// Railway backend: healthcheck, Recall webhooks + bot control, and WS bridge to OpenAI Realtime.
+// server.js — Railway: Recall API (create/list/end/ping) + webhook + WS bridge to OpenAI Realtime
 import express from "express";
 import http from "http";
 import cors from "cors";
@@ -17,16 +16,23 @@ const {
   VOICE = "verse",
   PERSONA_PROMPT = "You are Munffett, a concise, helpful investment co-analyst. Speak briefly and clearly.",
   ALLOWED_ORIGINS = "*",
+
+  // === Recall API setup ===
   RECALL_API_KEY,
-  RECALL_API_BASE = "https://api.recall.ai/v1",
+  RECALL_API_BASE = "https://api.recall.ai", // sem /v1
+  // paths padrão (Django/DRF costumam aceitar barra no final)
+  RECALL_PATH_LIST = "/v1/meeting-bots/",
+  RECALL_PATH_CREATE = "/v1/meeting-bots/",
+  RECALL_PATH_END_POST = "/v1/meeting-bots/:id/end/",
+  RECALL_PATH_DELETE = "/v1/meeting-bots/:id/",
 } = process.env;
 
 if (!OPENAI_API_KEY) {
-  console.error("Missing OPENAI_API_KEY env var.");
+  console.error("Missing OPENAI_API_KEY");
   process.exit(1);
 }
 if (!RECALL_API_KEY) {
-  console.error("Missing RECALL_API_KEY env var.");
+  console.error("Missing RECALL_API_KEY");
   process.exit(1);
 }
 
@@ -39,18 +45,21 @@ app.use(morgan("tiny"));
 
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// ---------- Recall helper (tenta 'Bearer' e 'Token') ----------
+// ---------- Helpers ----------
+const buildUrl = (path) => `${RECALL_API_BASE}${path}`;
+const tryHeaders = [
+  () => ({ Authorization: `Bearer ${RECALL_API_KEY}`, "Content-Type": "application/json" }),
+  () => ({ Authorization: `Token ${RECALL_API_KEY}`, "Content-Type": "application/json" }),
+];
+
 async function recallFetch(method, path, body) {
-  const url = `${RECALL_API_BASE}${path}`;
-  const tries = [
-    { Authorization: `Bearer ${RECALL_API_KEY}` },
-    { Authorization: `Token ${RECALL_API_KEY}` },
-  ];
-  let last;
-  for (const h of tries) {
+  const url = buildUrl(path);
+  let last = null;
+  for (const hdr of tryHeaders) {
+    const headers = hdr();
     const res = await fetch(url, {
       method,
-      headers: { "Content-Type": "application/json", ...h },
+      headers,
       body: body ? JSON.stringify(body) : undefined,
     });
     if (res.status !== 401) {
@@ -59,179 +68,118 @@ async function recallFetch(method, path, body) {
     }
     last = res;
   }
-  return last;
+  const text = await last.text();
+  console.log(`[Recall ${method}] ${url} -> ${last.status} ${last.statusText} :: ${text.slice(0, 180)}...`);
+  return { status: last.status, ok: last.ok, text };
 }
+const safeJson = (t) => { try { return JSON.parse(t); } catch { return { raw: t }; } };
+const subId = (tpl, id) => tpl.replace(":id", id);
 
-// ---------- Recall webhook (eventos Zoom/Recall) ----------
+// ---------- Webhook ----------
 app.post("/api/recall/webhook", async (req, res) => {
-  try {
-    console.log("[Recall webhook]", JSON.stringify(req.body || {}, null, 2).slice(0, 2000));
-    res.sendStatus(200);
-  } catch (e) {
-    console.error(e);
-    res.sendStatus(500);
-  }
+  console.log("[Recall webhook]", JSON.stringify(req.body || {}, null, 2).slice(0, 2000));
+  res.sendStatus(200);
 });
 
-// ---------- Recall create/list/end endpoints ----------
-
-// POST /api/recall/create  { "meeting_url": "https://zoom.us/j/..." }
-app.post("/api/recall/create", async (req, res) => {
-  try {
-    const meetingUrl = (req.body?.meeting_url || "").trim();
-    if (!meetingUrl) return res.status(400).json({ error: "missing meeting_url" });
-
-    // Config pede bi-directional audio e encaminha mídia para o nosso WS /ws/agent
-    const payload = {
-      name: AGENT_NAME,
-      join_behavior: "auto",                  // entrar sozinho
-      capabilities: {
-        transcription: false,                 // evita virar "note-taker"
-        bi_directional_audio: true
-      },
-      webhook_url: `${req.protocol}://${req.get("host")}/api/recall/webhook`,
-      media_relay: {
-        type: "websocket",
-        endpoint: `${req.protocol === "http" ? "ws" : "wss"}://${req.get("host")}/ws/agent`,
-        audio_format: "pcm16"
-      },
-      meeting_url: meetingUrl,               // link da call (Zoom/Meet/Teams)
-      // extras comuns; ignore se sua conta não usa
-      metadata: { source: "railway-demo", persona: AGENT_NAME }
-    };
-
-    const r = await recallFetch("POST", "/meeting-bots", payload);
-    const text = await r.text();
-    if (!r.ok) return res.status(r.status).json({ error: "recall_error", body: safeJson(text) });
-    return res.status(201).json(safeJson(text));
-  } catch (e) {
-    console.error("create-bot error:", e);
-    res.status(500).json({ error: "server_error" });
-  }
+// ---------- Diagnóstico ----------
+app.get("/api/recall/debug", (req, res) => {
+  res.json({
+    BASE: RECALL_API_BASE,
+    PATHS: { LIST: RECALL_PATH_LIST, CREATE: RECALL_PATH_CREATE, END_POST: RECALL_PATH_END_POST, DELETE: RECALL_PATH_DELETE },
+    HAS_KEY: !!RECALL_API_KEY,
+  });
 });
 
-// GET /api/recall/list
+app.get("/api/recall/ping", async (req, res) => {
+  const r = await recallFetch("GET", RECALL_PATH_LIST, null);
+  res.status(r.ok ? 200 : 500).json({ ok: r.ok, status: r.status, body: safeJson(r.text) });
+});
+
+// ---------- Bot control ----------
 app.get("/api/recall/list", async (_req, res) => {
-  try {
-    const r = await recallFetch("GET", "/meeting-bots", null);
-    const text = await r.text();
-    if (!r.ok) return res.status(r.status).json({ error: "recall_error", body: safeJson(text) });
-    return res.json(safeJson(text));
-  } catch (e) {
-    console.error("list-bots error:", e);
-    res.status(500).json({ error: "server_error" });
-  }
+  const r = await recallFetch("GET", RECALL_PATH_LIST, null);
+  res.status(r.ok ? 200 : r.status).json(r.ok ? safeJson(r.text) : { error: "recall_error", body: safeJson(r.text) });
+});
+
+// POST /api/recall/create  { meeting_url: "https://..." }
+app.post("/api/recall/create", async (req, res) => {
+  const meetingUrl = (req.body?.meeting_url || "").trim();
+  if (!meetingUrl) return res.status(400).json({ error: "missing meeting_url" });
+
+  const wsProto = req.protocol === "http" ? "ws" : "wss";
+  const host = req.get("host");
+  const payload = {
+    name: AGENT_NAME,
+    join_behavior: "auto",
+    capabilities: { transcription: false, bi_directional_audio: true },
+    webhook_url: `${req.protocol}://${host}/api/recall/webhook`,
+    media_relay: { type: "websocket", endpoint: `${wsProto}://${host}/ws/agent`, audio_format: "pcm16" },
+    meeting_url: meetingUrl,
+    metadata: { source: "railway", persona: AGENT_NAME }
+  };
+
+  const r = await recallFetch("POST", RECALL_PATH_CREATE, payload);
+  res.status(r.ok ? 201 : r.status).json(r.ok ? safeJson(r.text) : { error: "recall_error", body: safeJson(r.text) });
 });
 
 // POST /api/recall/end/:id
 app.post("/api/recall/end/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!id) return res.status(400).json({ error: "missing id" });
-    // dependendo da API, pode ser DELETE /meeting-bots/:id ou POST /meeting-bots/:id/end
-    let r = await recallFetch("POST", `/meeting-bots/${id}/end`, {});
-    if (r.status === 404) r = await recallFetch("DELETE", `/meeting-bots/${id}`, null);
-    const text = await r.text();
-    if (!r.ok) return res.status(r.status).json({ error: "recall_error", body: safeJson(text) });
-    return res.json(safeJson(text));
-  } catch (e) {
-    console.error("end-bot error:", e);
-    res.status(500).json({ error: "server_error" });
-  }
+  const id = req.params.id?.trim();
+  if (!id) return res.status(400).json({ error: "missing id" });
+
+  let r = await recallFetch("POST", subId(RECALL_PATH_END_POST, id), {});
+  if (r.status === 404) r = await recallFetch("DELETE", subId(RECALL_PATH_DELETE, id), null);
+  res.status(r.ok ? 200 : r.status).json(r.ok ? safeJson(r.text) : { error: "recall_error", body: safeJson(r.text) });
 });
 
-function safeJson(t) { try { return JSON.parse(t); } catch { return { raw: t }; } }
-
-// ---------- WS bridge to OpenAI Realtime ----------
+// ---------- WS bridge ----------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  if (req.url?.startsWith("/ws/agent")) {
-    wss.handleUpgrade(req, socket, head, (ws) => wsAgent(ws));
-  } else {
-    socket.destroy();
-  }
+  if (req.url?.startsWith("/ws/agent")) wss.handleUpgrade(req, socket, head, (ws) => wsAgent(ws));
+  else socket.destroy();
 });
 
 function wsAgent(clientWs) {
   const openaiUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`;
   const aiWs = new wsPkg(openaiUrl, {
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    },
+    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" },
     perMessageDeflate: false
   });
 
   const KA_MS = 25000;
-  const log = (...args) => console.log("[WS]", ...args);
-  const logClose = (who, code, reason) =>
-    console.warn(`[WS] ${who} closed: code=${code} reason=${reason?.toString() || ""}`);
-
   let kaClient = setInterval(() => { try { clientWs.ping(); } catch {} }, KA_MS);
   let kaAi = null;
 
-  clientWs.on("close", (code, reason) => {
-    logClose("client", code, reason);
-    try { aiWs.close(); } catch {}
-    clearInterval(kaClient);
-    if (kaAi) clearInterval(kaAi);
-  });
-  clientWs.on("error", (e) => console.error("[WS] client error:", e));
-
   aiWs.on("open", () => {
-    log("AI connected");
     kaAi = setInterval(() => { try { aiWs.ping(); } catch {} }, KA_MS);
-
-    const sessionUpdate = {
+    aiWs.send(JSON.stringify({
       type: "session.update",
-      session: {
-        voice: VOICE,
-        instructions: `${PERSONA_PROMPT}\n\nName: ${AGENT_NAME}`
-      }
-    };
-    aiWs.send(JSON.stringify(sessionUpdate));
+      session: { voice: VOICE, instructions: `${PERSONA_PROMPT}\n\nName: ${AGENT_NAME}` }
+    }));
   });
-
-  aiWs.on("close", (code, reason) => {
-    logClose("AI", code, reason);
-    try { clientWs.close(); } catch {}
-    if (kaAi) clearInterval(kaAi);
-  });
-  aiWs.on("error", (e) => console.error("[WS] AI error:", e));
 
   clientWs.on("message", (data, isBinary) => {
     try {
-      if (!isBinary) {
-        const text = data.toString("utf8");
-        log("client→AI text:", text.slice(0, 200));
-        aiWs.send(text);
-      } else {
+      if (!isBinary) aiWs.send(data.toString("utf8"));
+      else {
         const b64 = Buffer.isBuffer(data) ? data.toString("base64") : Buffer.from(data).toString("base64");
         aiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-        // lembre: o cliente deve enviar {"type":"input_audio_buffer.commit"} ao final do chunk
       }
-    } catch (err) {
-      console.error("[WS] client→AI forward error:", err);
-    }
+    } catch (e) { console.error("[WS] client→AI error:", e); }
   });
 
   aiWs.on("message", (msg, isBinary) => {
-    try {
-      if (!isBinary) {
-        const text = msg.toString("utf8");
-        log("AI→client text:", text.slice(0, 200));
-        clientWs.send(text);
-      } else {
-        clientWs.send(msg, { binary: true });
-      }
-    } catch (err) {
-      console.error("[WS] AI→client forward error:", err);
-    }
+    try { clientWs.send(msg, { binary: !!isBinary }); } catch (e) { console.error("[WS] AI→client error:", e); }
   });
+
+  const closeBoth = () => { try { aiWs.close(); } catch {} try { clientWs.close(); } catch {} };
+  aiWs.on("close", () => { clearInterval(kaAi); clearInterval(kaClient); closeBoth(); });
+  clientWs.on("close", () => { clearInterval(kaAi); clearInterval(kaClient); closeBoth(); });
+
+  aiWs.on("error", e => console.error("[WS] AI error:", e));
+  clientWs.on("error", e => console.error("[WS] client error:", e));
 }
 
-server.listen(Number(PORT), "0.0.0.0", () => {
-  console.log(`Server up on :${PORT}`);
-});
+server.listen(Number(PORT), "0.0.0.0", () => console.log(`server up on :${PORT}`));
