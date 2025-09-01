@@ -81,23 +81,20 @@ function wsAgent(clientWs) {
   });
 
   // Forward messages from client → OpenAI
-  clientWs.on("message", (data) => {
+  // Trate texto vs binário corretamente (o ws passa Buffer + flag isBinary)
+  clientWs.on("message", (data, isBinary) => {
     try {
-      // If it's text/JSON (e.g., realtime events), forward as-is
-      if (typeof data === "string") {
-        aiWs.send(data);
+      if (!isBinary) {
+        // Texto (JSON) vindo do cliente (ex.: wscat)
+        const text = data.toString("utf8");
+        aiWs.send(text);
         return;
       }
-      // If it's binary (audio frames), wrap as input_audio_buffer.append with base64
-      if (Buffer.isBuffer(data)) {
-        const b64 = data.toString("base64");
-        aiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-        // Note: client should also send a commit event when a chunk ends:
-        // { "type": "input_audio_buffer.commit" }
-        return;
-      }
-      // Fallback: forward raw
-      aiWs.send(data);
+
+      // Binário = frames de áudio: empacota como input_audio_buffer.append
+      const b64 = Buffer.isBuffer(data) ? data.toString("base64") : Buffer.from(data).toString("base64");
+      aiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+      // lembrando: o cliente deve enviar também {"type":"input_audio_buffer.commit"} ao fim de cada chunk
     } catch (err) {
       console.error("Client→AI forward error:", err);
     }
